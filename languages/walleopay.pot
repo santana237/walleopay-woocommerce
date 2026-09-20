@@ -1,0 +1,45 @@
+# Copyright (C) 2026 WalleoPay
+# This file is distributed under the GPLv2 or later.
+msgid ""
+msgstr ""
+"Project-Id-Version: WalleoPay pour WooCommerce 1.0.0\n"
+"Report-Msgid-Bugs-To: https://walleopay.com/support\n"
+"POT-Creation-Date: 2026-01-01T00:00:00+00:00\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language-Team: WalleoPay\n"
+"X-Domain: walleopay\n"
+"Plural-Forms: nplurals=2; plural=(n > 1);\n"
+
+#: walleopay-for-woocommerce.php
+msgid "WalleoPay pour WooCommerce requiert WooCommerce. Veuillez installer et activer WooCommerce."
+msgstr ""
+
+#: walleopay-for-woocommerce.php
+msgid "Réglages"
+msgstr ""
+
+#: includes/class-walleopay-gateway.php
+msgid "WalleoPay"
+msgstr ""
+
+#: includes/class-walleopay-gateway.php
+msgid "Mobile Money / Carte (WalleoPay)"
+msgstr ""
+
+#: includes/class-walleopay-gateway.php
+msgid "Activer le paiement WalleoPay"
+msgstr ""
+
+#: includes/class-walleopay-webhook.php
+msgid "Signature invalide."
+msgstr ""
+
+#: includes/class-walleopay-return.php
+msgid "Merci, votre paiement a bien été confirmé."
+msgstr ""
+
+#: includes/class-walleopay-admin.php
+msgid "Rafraîchir le statut WalleoPay"
+msgstr ""
