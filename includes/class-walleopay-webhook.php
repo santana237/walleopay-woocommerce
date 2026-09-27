@@ -344,7 +344,7 @@ class WalleoPay_Webhook {
 		$order_amount   = (int) round( (float) $order->get_total() );
 		$order_currency = strtoupper( (string) $order->get_currency() );
 
-		if ( $api_amount !== $order_amount ) {
+		if ( null === self::settled_amount( $payment, $order_amount ) ) {
 			return new WP_Error(
 				'walleopay_amount_mismatch',
 				sprintf(
@@ -369,6 +369,57 @@ class WalleoPay_Webhook {
 		}
 
 		return true;
+	}
+
+	/**
+	 * Part du paiement qui regle la commande, ou null si elle ne correspond pas.
+	 *
+	 * Quand le client paie la commission, WalleoPay l'ajoute par-dessus le
+	 * montant demande : `amount` vaut alors le total de la commande PLUS
+	 * `fee`, et `net` le total seul. Comparer `amount` au total echouait donc
+	 * a tous les coups, et chaque commande finissait « En attente » pour
+	 * montant incoherent.
+	 *
+	 * L'API ne dit pas qui porte la commission : l'extension glisse donc le
+	 * montant qu'elle demande dans les metadonnees (`requested_amount`).
+	 * Present, il doit valoir le total de la commande, et le paiement doit en
+	 * etre l'une des deux formes : le montant seul, ou le montant plus la
+	 * commission. Absent (paiement cree par une version anterieure), les deux
+	 * formes sont essayees sur le total. Un montant vraiment different bloque
+	 * toujours la commande.
+	 *
+	 * @param array $payment  Objet paiement renvoye par l'API.
+	 * @param int   $expected Montant attendu (total de la commande, en francs).
+	 *
+	 * @return array|null amount (regle), customer_fee (commission payee par le client, 0 sinon).
+	 */
+	public static function settled_amount( $payment, $expected ) {
+		$amount   = isset( $payment['amount'] ) ? (int) $payment['amount'] : -1;
+		$fee      = isset( $payment['fee'] ) ? (int) $payment['fee'] : 0;
+		$expected = (int) $expected;
+
+		if ( isset( $payment['metadata']['requested_amount'] ) && (int) $payment['metadata']['requested_amount'] !== $expected ) {
+			return null;
+		}
+
+		if ( $amount === $expected ) {
+			return array(
+				'amount'       => $expected,
+				'customer_fee' => 0,
+			);
+		}
+
+		// `net` est ce que le marchand touche : quand il est fourni, il doit
+		// tomber lui aussi sur le total de la commande.
+		if ( $fee > 0 && $amount - $fee === $expected
+			&& ( ! isset( $payment['net'] ) || (int) $payment['net'] === $expected ) ) {
+			return array(
+				'amount'       => $expected,
+				'customer_fee' => $fee,
+			);
+		}
+
+		return null;
 	}
 
 	/**
@@ -435,6 +486,21 @@ class WalleoPay_Webhook {
 						$suffix
 					)
 				);
+
+				// Le debit du client depasse alors le total de la commande :
+				// la note l'explique avant qu'on ne le decouvre au rapprochement.
+				$settled = self::settled_amount( $payment, (int) round( (float) $order->get_total() ) );
+
+				if ( null !== $settled && $settled['customer_fee'] > 0 ) {
+					$order->add_order_note(
+						sprintf(
+							/* translators: 1: commission payee par le client, 2: montant debite. */
+							__( 'WalleoPay : le client a payé la commission (%1$d) en plus du total de la commande. Montant débité : %2$d.', 'walleopay' ),
+							$settled['customer_fee'],
+							isset( $payment['amount'] ) ? (int) $payment['amount'] : 0
+						)
+					);
+				}
 
 				$order->update_meta_data( '_walleopay_completed', 'yes' );
 				$order->save();

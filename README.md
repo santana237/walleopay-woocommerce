@@ -29,29 +29,29 @@ Dans **WooCommerce → Réglages → Paiements → WalleoPay** :
 | Clé secrète de test | `sk_test_…` |
 | Clé secrète de production | `sk_live_…` |
 
-**Où les trouver :** tableau de bord WalleoPay (https://walleopay.com), section **Développeurs → Clés d'API**. La clé secrète ne s'affiche en clair qu'une fois : conservez-la dans un gestionnaire de mots de passe.
+**Où les trouver :** tableau de bord WalleoPay (https://walleopay.com), rubrique **Applications → Clés API** (ou **Applications → Mes services** pour la clé d'un service). Seul le propriétaire du compte obtient une clé secrète, et elle ne s'affiche en clair qu'à sa création : conservez-la dans un gestionnaire de mots de passe. Perdue, elle se renouvelle depuis le même écran.
 
 Le mode (test ou production) découle **de la clé utilisée**, jamais d'un paramètre de requête. La liste déroulante « Mode » indique simplement quelle clé l'extension doit envoyer.
+
+**Le mode test n'est pas une simulation.** Il passe par un vrai canal de paiement : le client est réellement débité et votre solde WalleoPay crédité, commission comprise. Seuls les clés, l'historique et les statistiques restent séparés de la production. Faites vos essais avec de petits montants.
 
 Ne collez jamais une clé secrète dans un thème, un script front-end ou un dépôt public.
 
 ### 3. URL de notification (webhook)
 
-L'URL à coller dans WalleoPay est affichée en haut de l'écran de réglages de la passerelle. Elle a cette forme :
+Il n'y a **rien à déclarer** côté WalleoPay : l'extension envoie son adresse de notification avec chaque paiement (champ `notify_url`), et WalleoPay la préfère toujours à l'URL de notification par défaut du compte. Elle est affichée en haut de l'écran de réglages de la passerelle, pour vérifier qu'elle répond publiquement, et a cette forme :
 
 ```
 https://votre-boutique.tld/wc-api/walleopay
 ```
 
-Dans le tableau de bord WalleoPay, section **Développeurs → Webhooks** :
+Le tableau de bord WalleoPay n'a pas d'écran d'abonnement aux événements : il connaît une seule **URL de notification par défaut**, réglée dans **Mon compte → Paramètres → URLs par défaut**. Elle ne sert qu'aux paiements créés sans `notify_url` et aux notifications de remboursement et de reversement. Vous pouvez y mettre l'adresse de la boutique ou la laisser vide : l'extension répond `200` aux événements qui ne concernent aucune commande.
 
-1. Créez un point de terminaison avec cette URL.
-2. Abonnez-le aux événements `payment.succeeded`, `payment.failed`, `payment.expired`, `payment.cancelled`, `payment.awaiting_confirmation`.
-3. Copiez le **secret de signature** (`whsec_…`) affiché à la création.
+Les notifications de paiement reçues sont `payment.succeeded`, `payment.failed`, `payment.expired`, `payment.cancelled` et `payment.awaiting_confirmation`. Leurs livraisons, avec la réponse de la boutique, se consultent dans **Applications → Notifications**.
 
 ### 4. Secret de webhook
 
-Collez le `whsec_…` dans le champ **Secret de webhook** des réglages, puis enregistrez. Sans ce secret, toutes les notifications entrantes sont rejetées avec un code HTTP 401.
+Copiez le **secret de signature** (`whsec_…`) affiché dans le tableau de bord WalleoPay, rubrique **Applications → Notifications** (il figure aussi sur l'écran **Clés API**). Il y en a **un seul par compte**, le même en test et en production. Collez-le dans le champ **Secret de webhook** des réglages, puis enregistrez. Sans ce secret, toutes les notifications entrantes sont rejetées avec un code HTTP 401.
 
 ### 5. Activation
 
@@ -64,7 +64,7 @@ L'extension ne marque **jamais** une commande payée sur la seule foi d'un webho
 1. **Signature** — l'en-tête `X-WalleoPay-Signature: t=<timestamp>,v1=<hmac>` est recalculé avec `hash_hmac('sha256', $t . '.' . $corps_brut, $whsec)` et comparé avec `hash_equals` (jamais `==`). Le corps est lu avec `file_get_contents('php://input')`, jamais ré-encodé.
 2. **Horodatage** — le `t=` doit avoir moins de 300 secondes, sinon la notification est rejetée (protection contre le rejeu).
 3. **Re-vérification API** — appel de `GET /payments/{id}`. Seul le statut renvoyé par l'API fait foi.
-4. **Montant et devise** — le `amount` (entier, francs CFA) et la `currency` renvoyés doivent correspondre au total et à la devise de la commande. En cas d'écart, une note est ajoutée, la commande passe en attente et **n'est pas validée**.
+4. **Montant et devise** — le `amount` (entier, francs CFA) et la `currency` renvoyés doivent correspondre au total et à la devise de la commande. Quand le client paie la commission (réglage « Qui paie la commission » du compte ou du service), WalleoPay l'ajoute par-dessus : `amount` vaut alors le total **plus** `fee`, et c'est `amount − fee` qui est comparé au total ; une note précise la commission payée. Pour ne rien deviner, l'extension joint à chaque paiement le montant qu'elle demande (métadonnée `requested_amount`), qui doit lui aussi valoir le total. En cas d'écart, une note est ajoutée, la commande passe en attente et **n'est pas validée**.
 
 Correspondance des statuts :
 
@@ -110,10 +110,10 @@ Vérifiez que l'extension est activée, que la case « Activer le paiement Walle
 La clé ne correspond pas au mode, a été régénérée, ou contient un espace copié par erreur. Recopiez-la depuis le tableau de bord.
 
 **« La vérification d'identité (KYC) du compte WalleoPay n'est pas encore approuvée ».**
-Le compte marchand doit être validé avant d'encaisser en production. Le mode Test reste utilisable en attendant.
+Le compte marchand doit être validé avant d'encaisser en production. Le mode Test reste utilisable en attendant — avec de l'argent réel : testez sur de petits montants.
 
 **Les commandes restent en attente alors que le client a payé.**
-Le webhook n'arrive probablement pas. Vérifiez que l'URL `…/wc-api/walleopay` répond publiquement (ni authentification HTTP, ni pare-feu, ni `noindex` bloquant), et que le secret `whsec_…` est bien celui du point de terminaison configuré. Les livraisons et leurs réponses sont visibles dans le tableau de bord WalleoPay.
+Le webhook n'arrive probablement pas. Vérifiez que l'URL `…/wc-api/walleopay` répond publiquement (ni authentification HTTP, ni pare-feu, ni `noindex` bloquant), et que le secret `whsec_…` est bien celui affiché dans **Applications → Notifications**. Les livraisons et leurs réponses y sont visibles, et une livraison en échec peut y être rejouée une fois le problème corrigé.
 
 **Le journal indique « Signature invalide ».**
 Le secret de webhook ne correspond pas, ou un module de sécurité/cache modifie le corps de la requête. La signature porte sur les octets exacts : tout module qui réécrit le JSON entrant la casse.
@@ -122,7 +122,7 @@ Le secret de webhook ne correspond pas, ou un module de sécurité/cache modifie
 L'horloge du serveur dérive de plus de 300 secondes. Synchronisez-la (NTP).
 
 **« WalleoPay : montant incohérent ».**
-Le montant confirmé ne correspond pas au total de la commande (souvent une devise mal réglée, ou des décimales activées alors que XAF n'en a pas). La commande est volontairement laissée en attente : vérifiez avant de la valider à la main.
+Le montant confirmé ne correspond pas au total de la commande, commission du client mise à part (souvent une devise mal réglée, ou des décimales activées alors que XAF n'en a pas). La commande est volontairement laissée en attente : vérifiez avant de la valider à la main.
 
 **Erreur 429 / « WalleoPay a temporairement limité les requêtes ».**
 La limite est de 120 requêtes par minute et par clé. L'extension respecte l'en-tête `Retry-After` et réessaie une fois. Si l'erreur persiste, espacez les rafraîchissements manuels.

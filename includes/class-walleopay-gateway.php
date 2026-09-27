@@ -125,7 +125,7 @@ class WC_Gateway_WalleoPay extends WC_Payment_Gateway {
 					'test' => __( 'Test (clé sk_test_…)', 'walleopay' ),
 					'live' => __( 'Production (clé sk_live_…)', 'walleopay' ),
 				),
-				'description' => __( 'Le mode réellement appliqué découle de la clé utilisée. Ce réglage indique simplement quelle clé envoyer.', 'walleopay' ),
+				'description' => __( 'Le mode réellement appliqué découle de la clé utilisée. Ce réglage indique simplement quelle clé envoyer. Le mode test n’est pas une simulation : il débite réellement le client et crédite votre solde WalleoPay, commission comprise. Faites vos essais avec de petits montants.', 'walleopay' ),
 			),
 			'test_secret_key' => array(
 				'title'       => __( 'Clé secrète de test', 'walleopay' ),
@@ -145,7 +145,7 @@ class WC_Gateway_WalleoPay extends WC_Payment_Gateway {
 				'default'     => '',
 				'description' => sprintf(
 					/* translators: %s: URL de notification. */
-					__( 'Commence par whsec_. Dans votre tableau de bord WalleoPay, créez un webhook pointant vers <code>%s</code>, puis collez ici le secret fourni. Sans ce secret, les notifications sont rejetées.', 'walleopay' ),
+					__( 'Commence par whsec_. Copiez le secret de signature affiché dans votre tableau de bord WalleoPay, rubrique Notifications : un seul secret par compte, le même en test et en production. L’extension transmet elle-même son adresse de notification (<code>%s</code>) avec chaque paiement. Sans ce secret, les notifications sont rejetées.', 'walleopay' ),
 					esc_url_raw( $notify_url )
 				),
 			),
@@ -175,7 +175,7 @@ class WC_Gateway_WalleoPay extends WC_Payment_Gateway {
 		$notify_url = WC()->api_request_url( 'walleopay' );
 
 		echo '<h2>' . esc_html__( 'WalleoPay', 'walleopay' ) . '</h2>';
-		echo '<p>' . esc_html__( 'Collez l’URL de notification ci-dessous dans le tableau de bord WalleoPay (section Webhooks) :', 'walleopay' ) . '</p>';
+		echo '<p>' . esc_html__( 'Adresse de notification de la boutique. L’extension l’envoie avec chaque paiement et WalleoPay la préfère à l’URL de notification par défaut de votre compte : il n’y a rien à coller dans le tableau de bord.', 'walleopay' ) . '</p>';
 		echo '<p><code>' . esc_html( $notify_url ) . '</code></p>';
 
 		if ( 'XAF' !== strtoupper( get_woocommerce_currency() ) ) {
@@ -394,6 +394,16 @@ class WC_Gateway_WalleoPay extends WC_Payment_Gateway {
 		 * @param WC_Order $order   Commande.
 		 */
 		$payload = apply_filters( 'walleopay_create_payment_payload', $payload, $order );
+
+		/*
+		 * Le montant demande voyage avec le paiement, apres le filtre : quand le
+		 * client paie la commission, `amount` la contient, et seul ce chiffre dit
+		 * sans ambiguite ce que la commande reclamait
+		 * (WalleoPay_Webhook::settled_amount()).
+		 */
+		if ( isset( $payload['metadata'] ) && is_array( $payload['metadata'] ) && isset( $payload['amount'] ) ) {
+			$payload['metadata']['requested_amount'] = (int) $payload['amount'];
+		}
 
 		$payment = $this->get_api()->create_payment( $payload, $this->build_idempotency_key( $order ) );
 

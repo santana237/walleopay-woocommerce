@@ -31,7 +31,7 @@ Points clés :
 2. Activez « WalleoPay pour WooCommerce ».
 3. Rendez-vous dans WooCommerce → Réglages → Paiements → WalleoPay.
 4. Choisissez le mode (Test ou Production) et collez la clé secrète correspondante (`sk_test_…` ou `sk_live_…`), disponible dans votre tableau de bord WalleoPay.
-5. Dans le tableau de bord WalleoPay, créez un webhook pointant vers l’URL affichée en haut de l’écran de réglages (de la forme `https://votre-boutique.tld/wc-api/walleopay`), puis collez le secret fourni (`whsec_…`) dans le champ « Secret de webhook ».
+5. Dans le tableau de bord WalleoPay, rubrique Applications → Notifications, copiez le secret de signature (`whsec_…`, un seul par compte, le même en test et en production) et collez-le dans le champ « Secret de webhook ». L’adresse de notification (de la forme `https://votre-boutique.tld/wc-api/walleopay`) n’a pas à être déclarée : l’extension l’envoie avec chaque paiement, et WalleoPay la préfère à l’URL par défaut du compte.
 6. Cochez « Activer le paiement WalleoPay » et enregistrez.
 
 == Frequently Asked Questions ==
@@ -50,11 +50,15 @@ Oui : sans webhook, les commandes ne seront validées qu’au retour du client s
 
 = Le webhook est-il suffisant pour valider une commande ? =
 
-Non, et l’extension ne s’y fie jamais. Après vérification de la signature et de l’horodatage, elle ré-interroge `GET /payments/{id}` et n’accepte la commande que si l’API répond `succeeded` avec un montant et une devise identiques à ceux de la commande. En cas d’écart, la commande est placée en attente avec une note, jamais validée.
+Non, et l’extension ne s’y fie jamais. Après vérification de la signature et de l’horodatage, elle ré-interroge `GET /payments/{id}` et n’accepte la commande que si l’API répond `succeeded` avec un montant (commission du client mise à part) et une devise identiques à ceux de la commande. En cas d’écart, la commande est placée en attente avec une note, jamais validée.
 
-= Puis-je tester sans argent réel ? =
+= Le mode Test utilise-t-il de l’argent réel ? =
 
-Oui : choisissez le mode Test et utilisez votre clé `sk_test_…`. Le mode réel découle toujours de la clé utilisée, jamais d’un paramètre de requête.
+Oui. Le mode Test n’est pas une simulation : il passe par un vrai canal de paiement, débite réellement le client et crédite votre solde WalleoPay, commission comprise. Seuls les clés, l’historique et les statistiques restent séparés de la production. Choisissez le mode Test, utilisez votre clé `sk_test_…` et faites vos essais avec de petits montants. Le mode effectivement appliqué découle toujours de la clé utilisée, jamais d’un paramètre de requête.
+
+= Mon client paie la commission : la commande est-elle validée ? =
+
+Oui. Quand la commission est à la charge du client, WalleoPay l’ajoute au montant demandé : le paiement porte sur le total de la commande plus la commission. L’extension met la commission de côté avant de comparer, valide la commande et ajoute une note indiquant la commission payée. Tout autre écart laisse la commande en attente.
 
 = Où consulter les échanges avec l’API ? =
 
