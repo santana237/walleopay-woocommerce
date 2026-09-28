@@ -76,6 +76,7 @@ function walleopay_wc_init() {
 	require_once WALLEOPAY_WC_PLUGIN_DIR . 'includes/class-walleopay-api.php';
 	require_once WALLEOPAY_WC_PLUGIN_DIR . 'includes/class-walleopay-webhook.php';
 	require_once WALLEOPAY_WC_PLUGIN_DIR . 'includes/class-walleopay-return.php';
+	require_once WALLEOPAY_WC_PLUGIN_DIR . 'includes/class-walleopay-attempts.php';
 	require_once WALLEOPAY_WC_PLUGIN_DIR . 'includes/class-walleopay-gateway.php';
 	require_once WALLEOPAY_WC_PLUGIN_DIR . 'includes/class-walleopay-admin.php';
 

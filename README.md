@@ -73,17 +73,41 @@ Correspondance des statuts :
 | `succeeded` | `payment_complete()` (WooCommerce choisit `processing` ou `completed`) |
 | `awaiting_confirmation` | `on-hold` avec note explicative |
 | `failed` | `failed` |
-| `cancelled`, `expired` | `cancelled` |
+| `cancelled`, `expired` | commande en attente de paiement ou échouée : inchangée, note ajoutée et stock rendu, pour que le client puisse retenter ; commande `on-hold` : `cancelled` |
 | `pending`, `processing` | inchangé (statut non définitif) |
 
 Le traitement est idempotent : une commande déjà payée n'est jamais revalidée, même si la notification est rejouée.
 
+Une commande peut compter plusieurs tentatives de paiement (voir plus bas). Seule la dernière présentée au client — celle de la métadonnée `_walleopay_payment_id` — fait encore évoluer la commande : la notification tardive d'une tentative remplacée (page expirée, page annulée parce que le total avait changé) ne la fait plus échouer ni annuler. L'argent, lui, compte d'où qu'il vienne : un paiement réussi ou annoncé au code marchand s'applique quelle que soit sa tentative. Si une tentative plus ancienne règle la commande, la page courante est fermée tant qu'elle attend encore le client. Et si un second paiement réussit malgré tout pour une commande déjà réglée, la commande n'est pas touchée : une note indique le paiement en trop, à rembourser depuis le tableau de bord WalleoPay.
+
 ## Fonctionnement côté client
 
 1. Le client choisit WalleoPay et valide sa commande.
-2. L'extension appelle `POST /payments` avec une clé `Idempotency-Key` déterministe (dérivée de l'identifiant, de la clé, du total et de la devise de la commande) puis redirige vers le `checkout_url`.
+2. L'extension appelle `POST /payments` avec la référence de la tentative (le numéro de commande, puis `-2`, `-3`…) et une clé `Idempotency-Key` propre à cette tentative, puis redirige vers le `checkout_url`.
 3. Après le paiement, le client revient sur `…/wc-api/walleopay_return?order_id=…&order_key=…`. Cette page **re-vérifie le statut auprès de l'API** avant d'afficher quoi que ce soit, puis redirige vers la page de remerciement, ou vers la page de règlement avec un message clair.
 4. Si le statut n'est pas définitif, le client voit « paiement en cours de confirmation » : la commande sera validée par le webhook.
+
+## Tentatives de paiement
+
+Un paiement échoué (solde insuffisant, code PIN refusé), annulé ou expiré (la page de paiement expire au bout de 30 minutes) ne condamne pas la commande : **Payer la commande** ouvre une nouvelle tentative, sous sa propre référence et avec sa propre clé d'idempotence — `1234`, puis `1234-2`, `1234-3`… Autrefois, la clé ne dépendait que de la commande : l'API rejouait la réponse d'origine et renvoyait le client sur la page du paiement échoué, sans possibilité de retenter.
+
+À chaque passage au paiement, l'extension relit l'état réel de la dernière tentative (`GET /payments/{référence}`) avant de décider :
+
+| Dernière tentative | Ce que voit le client |
+|---|---|
+| En cours (`pending`, `processing`), même total | La même page de paiement. |
+| `pending` mais le total a changé | Elle est annulée, puis une nouvelle tentative est ouverte. |
+| `processing` mais le total a changé | Un message d'attente : la demande est déjà sur le téléphone du client, on ne l'annule pas. |
+| `failed`, `cancelled`, `expired` | Une nouvelle tentative : `1234-2`, puis `1234-3`… |
+| `succeeded` ou `awaiting_confirmation` | Aucun nouveau paiement : le client passe par la page de retour, qui applique ce paiement à la commande. |
+
+Une nouvelle tentative ne s'ouvre qu'une fois la précédente close : il n'y a jamais deux paiements payables à la fois pour une même commande, et un paiement réussi ou en cours de rapprochement bloque toute nouvelle demande. Deux passages simultanés ne créent qu'un seul paiement.
+
+Une référence est unique pour tout le compte WalleoPay, test et production confondus. Un numéro déjà pris ailleurs — dans l'autre mode, ou par une copie de préproduction branchée sur le même compte — est enjambé : l'extension ne traite un paiement trouvé sous l'une de ses références que s'il porte la clé de la commande (métadonnée `order_key`), et n'annule ni ne ressert jamais celui d'une autre boutique. Si la boutique change de mode pendant qu'une page est ouverte, cette page est fermée avant qu'une autre ne s'ouvre dans le nouveau mode.
+
+Le filtre `walleopay_create_payment_payload` peut ajuster le corps envoyé, sauf la référence et les métadonnées `order_id` et `order_key`, reposées après lui : les tentatives en dépendent.
+
+Les paiements créés par la version précédente sous le seul numéro de commande restent reconnus comme première tentative.
 
 ## Rafraîchir un paiement à la main
 
@@ -93,13 +117,14 @@ Sur l'écran d'une commande, l'encart **WalleoPay** (colonne de droite) affiche 
 
 | Clé | Contenu |
 | --- | --- |
-| `_walleopay_payment_id` | Identifiant `pay_…` |
-| `_walleopay_reference` | Référence marchand (numéro de commande) |
+| `_walleopay_payment_id` | Identifiant `pay_…` de la tentative en cours |
+| `_walleopay_reference` | Référence de la tentative en cours (numéro de commande, puis `-2`, `-3`…) |
 | `_walleopay_mode` | `test` ou `live` au moment de la création |
 | `_walleopay_status` | Dernier statut connu de l'API |
 | `_walleopay_operator` | Opérateur ayant traité le paiement |
 | `_walleopay_checked_at` | Date UTC de la dernière re-vérification |
 | `_walleopay_completed` | `yes` une fois `payment_complete()` appliqué |
+| `_walleopay_duplicates` | Paiements réussis arrivés pour une commande déjà réglée, à rembourser |
 
 ## Dépannage
 
@@ -123,6 +148,12 @@ L'horloge du serveur dérive de plus de 300 secondes. Synchronisez-la (NTP).
 
 **« WalleoPay : montant incohérent ».**
 Le montant confirmé ne correspond pas au total de la commande, commission du client mise à part (souvent une devise mal réglée, ou des décimales activées alors que XAF n'en a pas). La commande est volontairement laissée en attente : vérifiez avant de la valider à la main.
+
+**« Un paiement WalleoPay est déjà en cours de validation pour cette commande ».**
+La dernière tentative est déjà sur le téléphone du client (`processing`) alors que le total a changé, ou son statut n'est pas lisible. Elle ne peut pas être annulée sans risque : le client valide ou laisse expirer la demande, puis réessaie.
+
+**« Trop de tentatives de paiement pour cette commande ».**
+L'extension n'a trouvé aucun numéro de tentative libre en dix essais (numéros pris ailleurs) ou la commande a atteint 999 tentatives. Réglez-la autrement, ou créez une nouvelle commande.
 
 **Erreur 429 / « WalleoPay a temporairement limité les requêtes ».**
 La limite est de 120 requêtes par minute et par clé. L'extension respecte l'en-tête `Retry-After` et réessaie une fois. Si l'erreur persiste, espacez les rafraîchissements manuels.

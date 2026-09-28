@@ -250,9 +250,11 @@ class WalleoPay_Webhook {
 			}
 		}
 
-		// Repli : la reference est le numero de commande, souvent egal a l'identifiant.
-		if ( ctype_digit( $reference ) ) {
-			$order = wc_get_order( absint( $reference ) );
+		// Repli : la reference est le numero de commande, souvent egal a
+		// l'identifiant, suivi du numero de tentative a partir de la deuxieme
+		// (« 1234-2 », voir WalleoPay_Attempts::reference()).
+		if ( preg_match( '/^(\d+)(?:-\d+)?$/', $reference, $matches ) ) {
+			$order = wc_get_order( absint( $matches[1] ) );
 
 			if ( $order instanceof WC_Order && 'walleopay' === $order->get_payment_method() ) {
 				return $order;
@@ -267,6 +269,16 @@ class WalleoPay_Webhook {
 	 * devise, puis applique le statut a la commande.
 	 *
 	 * Utilise par le webhook, la page de retour client et le bouton d'administration.
+	 *
+	 * Une commande peut compter plusieurs tentatives de paiement
+	 * (WalleoPay_Attempts) : « 1234 », puis « 1234-2 »… Seule la derniere
+	 * presentee au client (meta « _walleopay_payment_id ») dit encore ou en est
+	 * la commande. La notification tardive d'une tentative remplacee — la
+	 * page expiree d'hier, celle que l'extension a annulee parce que le total
+	 * avait change — ne la fait plus echouer ni annuler, et ne detourne plus
+	 * la page de retour vers un paiement mort. L'argent, lui, compte d'ou
+	 * qu'il vienne : un paiement reussi ou annonce au code marchand
+	 * s'applique quelle que soit sa tentative.
 	 *
 	 * @param WC_Order $order      Commande concernee.
 	 * @param string   $payment_id Identifiant WalleoPay (ou reference marchand).
@@ -309,6 +321,40 @@ class WalleoPay_Webhook {
 			return new WP_Error( 'missing_status', __( 'Statut de paiement absent de la réponse WalleoPay.', 'walleopay' ) );
 		}
 
+		$verified_id = isset( $payment['id'] ) ? (string) $payment['id'] : '';
+		$current_id  = (string) $order->get_meta( '_walleopay_payment_id' );
+		$is_current  = '' === $verified_id || '' === $current_id || $verified_id === $current_id;
+		$money       = 'succeeded' === $status || 'awaiting_confirmation' === $status;
+
+		// Commande deja reglee par un autre paiement : celui-ci ne change plus
+		// rien a la commande. S'il a reussi, le client a paye deux fois, et
+		// le marchand doit le savoir avant le rapprochement.
+		if ( '' !== $verified_id && $order->is_paid() && $verified_id !== (string) $order->get_transaction_id() ) {
+			if ( 'succeeded' === $status ) {
+				self::flag_duplicate( $order, $payment );
+			}
+
+			return $payment;
+		}
+
+		if ( ! $is_current && ! $money ) {
+			$gateway->log(
+				sprintf(
+					'Commande %1$d : la tentative %2$s (%3$s) a été remplacée par %4$s, rien n’est appliqué.',
+					$order->get_id(),
+					$verified_id,
+					$status,
+					$current_id
+				)
+			);
+
+			return $payment;
+		}
+
+		// Statut deja connu pour cette tentative : evite de repeter une note a
+		// chaque relecture (notification, retour client, rafraichissement).
+		$previous_status = $is_current ? (string) $order->get_meta( '_walleopay_status' ) : '';
+
 		self::store_payment_meta( $order, $payment );
 
 		// 4. Controle du montant et de la devise avant toute validation.
@@ -324,9 +370,81 @@ class WalleoPay_Webhook {
 			}
 		}
 
-		self::apply_status( $order, $payment, $context );
+		self::apply_status( $order, $payment, $context, $previous_status );
+
+		// Une tentative plus ancienne vient de regler la commande : la page
+		// courante, si elle attend encore le client, n'a plus d'objet.
+		if ( ! $is_current && 'succeeded' === $status && $order->is_paid() ) {
+			self::close_superseded( $api, $current_id );
+		}
 
 		return $payment;
+	}
+
+	/**
+	 * Ferme la tentative courante quand une autre a deja regle la commande.
+	 *
+	 * Seulement si elle attend encore le client (« pending ») : une demande
+	 * deja partie vers son telephone ne s'annule pas sans risque, et un echec
+	 * ici ne change rien a la commande, deja reglee. Si elle aboutit malgre
+	 * tout, flag_duplicate() le signalera.
+	 *
+	 * @param WalleoPay_API $api        Client du mode de la commande.
+	 * @param string        $payment_id Tentative courante.
+	 *
+	 * @return void
+	 */
+	protected static function close_superseded( $api, $payment_id ) {
+		$current = $api->get_payment( $payment_id );
+
+		if ( is_wp_error( $current ) || ! isset( $current['status'] ) || 'pending' !== $current['status'] ) {
+			return;
+		}
+
+		$cancel = $api->cancel_payment( $payment_id );
+
+		if ( is_wp_error( $cancel ) ) {
+			WC_Gateway_WalleoPay::instance()->log( 'Tentative ' . $payment_id . ' non fermée : ' . $cancel->get_error_message(), 'error' );
+		}
+	}
+
+	/**
+	 * Signale, une seule fois, un paiement reussi arrive pour une commande
+	 * deja reglee par un autre.
+	 *
+	 * L'extension n'ouvre jamais deux tentatives payables a la fois, mais une
+	 * page d'echec encore ouverte dans un autre onglet peut etre relancee par
+	 * le client. La commande n'est pas touchee : la note dit quoi rembourser.
+	 *
+	 * @param WC_Order $order   Commande deja reglee.
+	 * @param array    $payment Paiement reussi, relu aupres de l'API.
+	 *
+	 * @return void
+	 */
+	protected static function flag_duplicate( $order, $payment ) {
+		$payment_id = isset( $payment['id'] ) ? (string) $payment['id'] : '';
+		$known      = $order->get_meta( '_walleopay_duplicates' );
+		$known      = is_array( $known ) ? $known : array();
+
+		if ( '' === $payment_id || in_array( $payment_id, $known, true ) ) {
+			return;
+		}
+
+		$known[] = $payment_id;
+		$order->update_meta_data( '_walleopay_duplicates', $known );
+
+		$order->add_order_note(
+			sprintf(
+				/* translators: 1: identifiant du paiement en trop, 2: transaction qui a regle la commande. */
+				__( 'WalleoPay : le paiement %1$s a réussi alors que la commande était déjà réglée (%2$s). Vérifiez s’il faut le rembourser depuis votre tableau de bord WalleoPay.', 'walleopay' ),
+				$payment_id,
+				'' !== (string) $order->get_transaction_id() ? (string) $order->get_transaction_id() : '—'
+			)
+		);
+
+		$order->save();
+
+		WC_Gateway_WalleoPay::instance()->log( 'Commande ' . $order->get_id() . ' : second paiement réussi ' . $payment_id . '.', 'error' );
 	}
 
 	/**
@@ -458,13 +576,14 @@ class WalleoPay_Webhook {
 	/**
 	 * Applique le statut du paiement a la commande. Idempotent.
 	 *
-	 * @param WC_Order $order   Commande.
-	 * @param array    $payment Objet paiement verifie aupres de l'API.
-	 * @param string   $context Contexte pour les notes.
+	 * @param WC_Order $order           Commande.
+	 * @param array    $payment         Objet paiement verifie aupres de l'API.
+	 * @param string   $context         Contexte pour les notes.
+	 * @param string   $previous_status Statut deja connu de cette tentative, '' sinon.
 	 *
 	 * @return void
 	 */
-	public static function apply_status( $order, $payment, $context = '' ) {
+	public static function apply_status( $order, $payment, $context = '', $previous_status = '' ) {
 		$status     = isset( $payment['status'] ) ? (string) $payment['status'] : '';
 		$payment_id = isset( $payment['id'] ) ? (string) $payment['id'] : '';
 		$operator   = isset( $payment['operator'] ) ? (string) $payment['operator'] : '';
@@ -559,20 +678,46 @@ class WalleoPay_Webhook {
 					return;
 				}
 
-				$order->update_status(
-					'cancelled',
-					'expired' === $status
-						? sprintf(
-							/* translators: %s: contexte. */
-							__( 'Paiement WalleoPay expiré avant confirmation.%s', 'walleopay' ),
-							$suffix
-						)
-						: sprintf(
-							/* translators: %s: contexte. */
-							__( 'Paiement WalleoPay annulé.%s', 'walleopay' ),
-							$suffix
-						)
-				);
+				$note = 'expired' === $status
+					? sprintf(
+						/* translators: %s: contexte. */
+						__( 'Paiement WalleoPay expiré avant confirmation.%s', 'walleopay' ),
+						$suffix
+					)
+					: sprintf(
+						/* translators: %s: contexte. */
+						__( 'Paiement WalleoPay annulé.%s', 'walleopay' ),
+						$suffix
+					);
+
+				/*
+				 * La commande attend encore son paiement : elle reste payable.
+				 * Une page laissee expirer ou abandonnee par le client annulait
+				 * la commande, et « Payer la commande » — ou la page de retour
+				 * elle-meme, qui y renvoie le client pour « relancer le
+				 * reglement » — se heurtait a une commande annulee. La tentative
+				 * suivante s'ouvre desormais sous sa propre reference
+				 * (WalleoPay_Attempts). Le stock, lui, est rendu comme le
+				 * faisait l'annulation : la tentative suivante le reserve a
+				 * nouveau, et une commande jamais reglee finit annulee par
+				 * WooCommerce au terme de la reservation de stock.
+				 */
+				if ( $order->has_status( array( 'pending', 'failed' ) ) ) {
+					if ( $previous_status === $status ) {
+						return;
+					}
+
+					$order->add_order_note( $note );
+
+					if ( function_exists( 'wc_maybe_increase_stock_levels' ) ) {
+						wc_maybe_increase_stock_levels( $order->get_id() );
+					}
+					break;
+				}
+
+				// En attente d'un rapprochement qui n'a pas abouti : la
+				// commande est close, comme avant.
+				$order->update_status( 'cancelled', $note );
 				break;
 
 			default:

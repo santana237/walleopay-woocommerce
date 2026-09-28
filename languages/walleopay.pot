@@ -43,3 +43,21 @@ msgstr ""
 #: includes/class-walleopay-admin.php
 msgid "Rafraîchir le statut WalleoPay"
 msgstr ""
+
+#. translators: 1: identifiant du paiement, 2: mode, 3: reference.
+#: includes/class-walleopay-gateway.php
+msgid "Paiement WalleoPay créé (%1$s, mode %2$s, référence %3$s). En attente de confirmation par l’opérateur."
+msgstr ""
+
+#: includes/class-walleopay-gateway.php
+msgid "Un paiement WalleoPay est déjà en cours de validation pour cette commande. Réessayez dans quelques minutes."
+msgstr ""
+
+#: includes/class-walleopay-gateway.php
+msgid "Trop de tentatives de paiement pour cette commande. Contactez la boutique pour la régler."
+msgstr ""
+
+#. translators: 1: identifiant du paiement en trop, 2: transaction qui a regle la commande.
+#: includes/class-walleopay-webhook.php
+msgid "WalleoPay : le paiement %1$s a réussi alors que la commande était déjà réglée (%2$s). Vérifiez s’il faut le rembourser depuis votre tableau de bord WalleoPay."
+msgstr ""

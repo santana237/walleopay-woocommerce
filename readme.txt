@@ -56,6 +56,10 @@ Non, et l’extension ne s’y fie jamais. Après vérification de la signature 
 
 Oui. Le mode Test n’est pas une simulation : il passe par un vrai canal de paiement, débite réellement le client et crédite votre solde WalleoPay, commission comprise. Seuls les clés, l’historique et les statistiques restent séparés de la production. Choisissez le mode Test, utilisez votre clé `sk_test_…` et faites vos essais avec de petits montants. Le mode effectivement appliqué découle toujours de la clé utilisée, jamais d’un paramètre de requête.
 
+= Mon client peut-il réessayer après un paiement échoué ou expiré ? =
+
+Oui. La commande reste payable, et « Payer la commande » ouvre une nouvelle tentative sous sa propre référence (numéro de commande, puis `-2`, `-3`…) et sa propre clé d’idempotence. Une nouvelle tentative ne s’ouvre qu’une fois la précédente close : il n’y a jamais deux paiements payables à la fois pour une même commande, et un paiement réussi ou en cours de rapprochement bloque toute nouvelle demande.
+
 = Mon client paie la commission : la commande est-elle validée ? =
 
 Oui. Quand la commission est à la charge du client, WalleoPay l’ajoute au montant demandé : le paiement porte sur le total de la commande plus la commission. L’extension met la commission de côté avant de comparer, valide la commande et ajoute une note indiquant la commission payée. Tout autre écart laisse la commande en attente.
@@ -69,6 +73,7 @@ Activez « Journalisation » dans les réglages, puis ouvrez WooCommerce → Ét
 = 1.0.0 =
 * Première version publique.
 * Création de paiement avec clé d’idempotence déterministe et redirection vers la page de paiement WalleoPay.
+* Tentatives de paiement : après un échec, une annulation ou une expiration, « Payer la commande » ouvre une nouvelle tentative (référence suffixée `-2`, `-3`…, clé propre), jamais deux paiements payables à la fois ; la notification d’une tentative remplacée ne touche plus la commande ; un second paiement réussi est signalé par une note.
 * Webhook signé (HMAC SHA-256, `hash_equals`, tolérance de 300 s) avec re-vérification obligatoire auprès de l’API.
 * Contrôle du montant et de la devise avant toute validation de commande.
 * Page de retour client re-vérifiée côté serveur.

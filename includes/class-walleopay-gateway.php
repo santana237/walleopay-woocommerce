@@ -301,19 +301,53 @@ class WC_Gateway_WalleoPay extends WC_Payment_Gateway {
 	}
 
 	/**
-	 * Cle d'idempotence deterministe : identique tant que la commande et son montant
-	 * ne changent pas, differente des qu'ils changent.
+	 * Racine des references de la commande : son numero, a defaut son
+	 * identifiant. Les tentatives suivantes y ajoutent « -2 », « -3 »…
+	 * (WalleoPay_Attempts::reference()).
+	 *
+	 * Coupee a 115 caracteres : l'API en accepte 120, suffixe compris.
 	 *
 	 * @param WC_Order $order Commande.
 	 *
 	 * @return string
 	 */
-	public function build_idempotency_key( $order ) {
+	public function build_base_reference( $order ) {
+		$reference = (string) $order->get_order_number();
+
+		if ( '' === $reference ) {
+			$reference = (string) $order->get_id();
+		}
+
+		return substr( $reference, 0, 115 );
+	}
+
+	/**
+	 * Cle d'idempotence deterministe d'une tentative.
+	 *
+	 * Elle porte la reference, donc le numero de tentative : deux passages
+	 * simultanes au paiement ne creent qu'un paiement, mais une tentative close
+	 * n'est jamais rejouee — la suivante a sa propre cle. Elle porte aussi le
+	 * mode : les cles d'idempotence valent pour tout le compte, test et
+	 * production confondus.
+	 *
+	 * @param WC_Order $order     Commande.
+	 * @param string   $reference Reference de la tentative.
+	 *
+	 * @return string
+	 */
+	public function build_idempotency_key( $order, $reference = '' ) {
+		if ( '' === (string) $reference ) {
+			$reference = $this->build_base_reference( $order );
+		}
+
 		$fingerprint = implode(
 			'|',
 			array(
+				home_url( '/' ),
+				$this->get_mode(),
 				$order->get_id(),
 				$order->get_order_key(),
+				(string) $reference,
 				(int) round( (float) $order->get_total() ),
 				strtoupper( (string) $order->get_currency() ),
 			)
@@ -323,43 +357,15 @@ class WC_Gateway_WalleoPay extends WC_Payment_Gateway {
 	}
 
 	/**
-	 * Cree le paiement et redirige le client vers la page de paiement WalleoPay.
+	 * Corps de POST /payments pour une tentative.
 	 *
-	 * @param int $order_id Identifiant de commande.
+	 * @param WC_Order $order     Commande.
+	 * @param string   $reference Reference de la tentative.
 	 *
 	 * @return array
 	 */
-	public function process_payment( $order_id ) {
-		$order = wc_get_order( $order_id );
-
-		if ( ! $order instanceof WC_Order ) {
-			wc_add_notice( __( 'Commande introuvable.', 'walleopay' ), 'error' );
-
-			return array( 'result' => 'failure' );
-		}
-
-		$amount = (int) round( (float) $order->get_total() );
-
-		if ( $amount < 100 ) {
-			wc_add_notice( __( 'Le montant minimum accepté par WalleoPay est de 100 FCFA.', 'walleopay' ), 'error' );
-
-			return array( 'result' => 'failure' );
-		}
-
-		if ( $amount > 1000000 ) {
-			wc_add_notice( __( 'Le montant maximum accepté par WalleoPay est de 1 000 000 FCFA.', 'walleopay' ), 'error' );
-
-			return array( 'result' => 'failure' );
-		}
-
-		$reference = (string) $order->get_order_number();
-
-		if ( '' === $reference ) {
-			$reference = (string) $order->get_id();
-		}
-
-		$reference = substr( $reference, 0, 120 );
-
+	public function build_payment_payload( $order, $reference ) {
+		$amount        = (int) round( (float) $order->get_total() );
 		$customer_name = trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() );
 
 		$description = sprintf(
@@ -395,65 +401,188 @@ class WC_Gateway_WalleoPay extends WC_Payment_Gateway {
 		 */
 		$payload = apply_filters( 'walleopay_create_payment_payload', $payload, $order );
 
+		if ( ! isset( $payload['metadata'] ) || ! is_array( $payload['metadata'] ) ) {
+			$payload['metadata'] = array();
+		}
+
+		/*
+		 * Ce qui suit est repose apres le filtre, parce que les tentatives en
+		 * dependent : la reference porte le numero de tentative, et la cle de
+		 * commande prouve qu'un paiement retrouve sous cette reference est
+		 * bien celui de cette commande (WalleoPay_Attempts::is_ours()). Un
+		 * filtre qui les changerait ferait ouvrir une tentative par passage.
+		 */
+		$payload['reference']             = $reference;
+		$payload['metadata']['order_id']  = (string) $order->get_id();
+		$payload['metadata']['order_key'] = (string) $order->get_order_key();
+
 		/*
 		 * Le montant demande voyage avec le paiement, apres le filtre : quand le
 		 * client paie la commission, `amount` la contient, et seul ce chiffre dit
 		 * sans ambiguite ce que la commande reclamait
 		 * (WalleoPay_Webhook::settled_amount()).
 		 */
-		if ( isset( $payload['metadata'] ) && is_array( $payload['metadata'] ) && isset( $payload['amount'] ) ) {
+		if ( isset( $payload['amount'] ) ) {
 			$payload['metadata']['requested_amount'] = (int) $payload['amount'];
 		}
 
-		$payment = $this->get_api()->create_payment( $payload, $this->build_idempotency_key( $order ) );
+		return $payload;
+	}
 
-		if ( is_wp_error( $payment ) ) {
-			$this->log( 'Création du paiement refusée pour la commande ' . $order->get_id() . ' : ' . $payment->get_error_message(), 'error' );
+	/**
+	 * Presente au client la tentative de paiement de la commande : la page
+	 * encore ouverte, ou une nouvelle quand la precedente est close.
+	 *
+	 * La regle vit dans WalleoPay_Attempts ; ici, on ne fait qu'appliquer son
+	 * verdict a la commande.
+	 *
+	 * @param int $order_id Identifiant de commande.
+	 *
+	 * @return array
+	 */
+	public function process_payment( $order_id ) {
+		$order = wc_get_order( $order_id );
 
-			$order->add_order_note(
-				sprintf(
-					/* translators: %s: message d'erreur. */
-					__( 'WalleoPay : création du paiement impossible. %s', 'walleopay' ),
-					$payment->get_error_message()
-				)
-			);
-
-			wc_add_notice( $payment->get_error_message(), 'error' );
-
-			return array( 'result' => 'failure' );
-		}
-
-		$checkout_url = isset( $payment['checkout_url'] ) ? (string) $payment['checkout_url'] : '';
-
-		if ( '' === $checkout_url ) {
-			$this->log( 'Aucune checkout_url renvoyée pour la commande ' . $order->get_id(), 'error' );
-			wc_add_notice( __( 'WalleoPay n’a pas renvoyé de page de paiement. Veuillez réessayer.', 'walleopay' ), 'error' );
+		if ( ! $order instanceof WC_Order ) {
+			wc_add_notice( __( 'Commande introuvable.', 'walleopay' ), 'error' );
 
 			return array( 'result' => 'failure' );
 		}
 
-		$order->update_meta_data( '_walleopay_payment_id', sanitize_text_field( isset( $payment['id'] ) ? (string) $payment['id'] : '' ) );
-		$order->update_meta_data( '_walleopay_reference', sanitize_text_field( isset( $payment['reference'] ) ? (string) $payment['reference'] : $reference ) );
-		$order->update_meta_data( '_walleopay_mode', sanitize_text_field( isset( $payment['mode'] ) ? (string) $payment['mode'] : $this->get_mode() ) );
-		$order->update_meta_data( '_walleopay_status', sanitize_text_field( isset( $payment['status'] ) ? (string) $payment['status'] : 'pending' ) );
+		$amount = (int) round( (float) $order->get_total() );
+
+		if ( $amount < 100 ) {
+			wc_add_notice( __( 'Le montant minimum accepté par WalleoPay est de 100 FCFA.', 'walleopay' ), 'error' );
+
+			return array( 'result' => 'failure' );
+		}
+
+		if ( $amount > 1000000 ) {
+			wc_add_notice( __( 'Le montant maximum accepté par WalleoPay est de 1 000 000 FCFA.', 'walleopay' ), 'error' );
+
+			return array( 'result' => 'failure' );
+		}
+
+		$attempts = new WalleoPay_Attempts(
+			$this->get_api(),
+			$this->build_base_reference( $order ),
+			$order->get_id(),
+			$order->get_order_key(),
+			function ( $reference ) use ( $order ) {
+				return array(
+					$this->build_payment_payload( $order, $reference ),
+					$this->build_idempotency_key( $order, $reference ),
+				);
+			}
+		);
+
+		// Le paiement presente en dernier, relu avec la cle de son propre mode :
+		// il ne doit pas rester payable a cote d'un nouveau.
+		$current_id   = (string) $order->get_meta( '_walleopay_payment_id' );
+		$current_mode = (string) $order->get_meta( '_walleopay_mode' );
+		$current_api  = $this->get_api_for_order( $order );
+
+		if ( ! $current_api->has_key() ) {
+			$current_id = '';
+		}
+
+		$outcome = $attempts->open(
+			$amount,
+			strtoupper( (string) $order->get_currency() ),
+			$current_id,
+			$current_api,
+			'' === $current_mode || $current_mode === $this->get_mode()
+		);
+
+		switch ( $outcome['state'] ) {
+			case 'open':
+				$payment = $outcome['payment'];
+				$this->remember_attempt( $order, $payment );
+
+				if ( ! empty( $outcome['created'] ) ) {
+					$order->add_order_note(
+						sprintf(
+							/* translators: 1: identifiant du paiement, 2: mode, 3: reference. */
+							__( 'Paiement WalleoPay créé (%1$s, mode %2$s, référence %3$s). En attente de confirmation par l’opérateur.', 'walleopay' ),
+							isset( $payment['id'] ) ? $payment['id'] : '—',
+							isset( $payment['mode'] ) ? $payment['mode'] : $this->get_mode(),
+							isset( $payment['reference'] ) ? $payment['reference'] : '—'
+						)
+					);
+				}
+
+				$order->save();
+
+				// Le stock est reserve, mais la commande reste impayee tant que l'API n'a pas confirme.
+				wc_maybe_reduce_stock_levels( $order->get_id() );
+
+				return array(
+					'result'   => 'success',
+					'redirect' => (string) $payment['checkout_url'],
+				);
+
+			case 'paid':
+			case 'awaiting':
+				/*
+				 * De l'argent est deja arrive, ou annonce au code marchand : on
+				 * n'en demande pas davantage. La page de retour relit ce
+				 * paiement aupres de l'API et l'applique a la commande, comme le
+				 * ferait la notification qui n'est pas encore arrivee.
+				 */
+				$this->remember_attempt( $order, $outcome['payment'] );
+				$order->save();
+
+				return array(
+					'result'   => 'success',
+					'redirect' => WalleoPay_Return::get_return_url( $order ),
+				);
+
+			case 'busy':
+				wc_add_notice( __( 'Un paiement WalleoPay est déjà en cours de validation pour cette commande. Réessayez dans quelques minutes.', 'walleopay' ), 'error' );
+
+				return array( 'result' => 'failure' );
+
+			case 'exhausted':
+				$this->log( 'Commande ' . $order->get_id() . ' : plus aucun numéro de tentative disponible.', 'error' );
+				wc_add_notice( __( 'Trop de tentatives de paiement pour cette commande. Contactez la boutique pour la régler.', 'walleopay' ), 'error' );
+
+				return array( 'result' => 'failure' );
+		}
+
+		$error = isset( $outcome['error'] ) && is_wp_error( $outcome['error'] )
+			? $outcome['error']
+			: new WP_Error( 'walleopay_unexpected_response', __( 'Réponse inattendue de WalleoPay.', 'walleopay' ) );
+
+		$this->log( 'Création du paiement refusée pour la commande ' . $order->get_id() . ' : ' . $error->get_error_message(), 'error' );
 
 		$order->add_order_note(
 			sprintf(
-				/* translators: 1: identifiant du paiement, 2: mode. */
-				__( 'Paiement WalleoPay créé (%1$s, mode %2$s). En attente de confirmation par l’opérateur.', 'walleopay' ),
-				isset( $payment['id'] ) ? $payment['id'] : '—',
-				isset( $payment['mode'] ) ? $payment['mode'] : $this->get_mode()
+				/* translators: %s: message d'erreur. */
+				__( 'WalleoPay : création du paiement impossible. %s', 'walleopay' ),
+				$error->get_error_message()
 			)
 		);
 
-		$order->save();
+		wc_add_notice( $error->get_error_message(), 'error' );
 
-		// Le stock est reserve, mais la commande reste impayee tant que l'API n'a pas confirme.
-		wc_maybe_reduce_stock_levels( $order->get_id() );
+		return array( 'result' => 'failure' );
+	}
 
-		return array(
-			'result'   => 'success',
-			'redirect' => $checkout_url,
-		);
+	/**
+	 * Fait de ce paiement la tentative courante de la commande : c'est celle
+	 * que relisent la page de retour et le bouton de rafraichissement, et la
+	 * seule dont un echec ou une expiration touche encore la commande
+	 * (WalleoPay_Webhook::verify_and_apply()).
+	 *
+	 * @param WC_Order $order   Commande.
+	 * @param array    $payment Paiement relu aupres de l'API.
+	 *
+	 * @return void
+	 */
+	protected function remember_attempt( $order, $payment ) {
+		$order->update_meta_data( '_walleopay_payment_id', sanitize_text_field( isset( $payment['id'] ) ? (string) $payment['id'] : '' ) );
+		$order->update_meta_data( '_walleopay_reference', sanitize_text_field( isset( $payment['reference'] ) ? (string) $payment['reference'] : '' ) );
+		$order->update_meta_data( '_walleopay_mode', sanitize_text_field( isset( $payment['mode'] ) ? (string) $payment['mode'] : $this->get_mode() ) );
+		$order->update_meta_data( '_walleopay_status', sanitize_text_field( isset( $payment['status'] ) ? (string) $payment['status'] : 'pending' ) );
 	}
 }

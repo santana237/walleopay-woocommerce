@@ -42,6 +42,13 @@ class WalleoPay_API {
 	protected $logger = null;
 
 	/**
+	 * La derniere reponse etait-elle rejouee par l'idempotence ?
+	 *
+	 * @var bool
+	 */
+	protected $last_replayed = false;
+
+	/**
 	 * Constructeur.
 	 *
 	 * @param string $secret_key Cle secrete WalleoPay.
@@ -125,6 +132,20 @@ class WalleoPay_API {
 	}
 
 	/**
+	 * La derniere reponse portait-elle l'en-tete « Idempotent-Replay: true » ?
+	 *
+	 * Une telle reponse est celle de la creation d'origine, rejouee telle
+	 * quelle : elle decrit le paiement a sa naissance, pas tel qu'il est. Un
+	 * paiement echoue depuis y figure encore « pending », avec sa page morte.
+	 * WalleoPay_Attempts le relit donc par GET avant de le presenter.
+	 *
+	 * @return bool
+	 */
+	public function was_replayed() {
+		return $this->last_replayed;
+	}
+
+	/**
 	 * Recupere les informations du compte marchand (utile pour tester une cle).
 	 *
 	 * @return array|WP_Error
@@ -145,6 +166,8 @@ class WalleoPay_API {
 	 * @return array|WP_Error
 	 */
 	protected function request( $method, $path, $body = array(), $headers = array(), $is_retry = false ) {
+		$this->last_replayed = false;
+
 		if ( ! $this->has_key() ) {
 			return new WP_Error(
 				'walleopay_missing_key',
@@ -213,6 +236,9 @@ class WalleoPay_API {
 			$parsed = array();
 		}
 
+		$replayed            = wp_remote_retrieve_header( $response, 'idempotent-replay' );
+		$this->last_replayed = 'true' === strtolower( trim( is_array( $replayed ) ? (string) reset( $replayed ) : (string) $replayed ) );
+
 		// Limitation de debit : un seul reessai, en respectant Retry-After.
 		if ( 429 === $status ) {
 			$retry_after = (int) wp_remote_retrieve_header( $response, 'retry-after' );
@@ -238,13 +264,9 @@ class WalleoPay_API {
 		}
 
 		if ( $status < 200 || $status > 299 ) {
-			$type    = '';
-			$message = '';
-
-			if ( isset( $parsed['error'] ) && is_array( $parsed['error'] ) ) {
-				$type    = isset( $parsed['error']['type'] ) ? (string) $parsed['error']['type'] : '';
-				$message = isset( $parsed['error']['message'] ) ? (string) $parsed['error']['message'] : '';
-			}
+			$error   = self::parse_error( $parsed );
+			$type    = $error['type'];
+			$message = $error['message'];
 
 			if ( '' === $message ) {
 				$message = sprintf(
@@ -263,6 +285,7 @@ class WalleoPay_API {
 					'status'  => $status,
 					'type'    => $type,
 					'message' => $message,
+					'fields'  => $error['fields'],
 				)
 			);
 		}
@@ -282,6 +305,57 @@ class WalleoPay_API {
 	}
 
 	/**
+	 * Ramene les deux formes d'erreur de l'API a un type, un message et la
+	 * liste des champs refuses.
+	 *
+	 * Les erreurs metier arrivent sous « error » ; les erreurs de validation
+	 * sous la forme Laravel « message » + « errors » par champ. Cette seconde
+	 * forme passait jusqu'ici pour une erreur HTTP 422 anonyme : impossible
+	 * d'y reconnaitre une reference deja prise, que les tentatives de
+	 * paiement doivent enjamber (WalleoPay_Attempts::is_taken()).
+	 *
+	 * @param array $parsed Corps JSON decode.
+	 *
+	 * @return array type, message, fields (liste des champs refuses).
+	 */
+	public static function parse_error( $parsed ) {
+		$parsed = is_array( $parsed ) ? $parsed : array();
+		$error  = array(
+			'type'    => '',
+			'message' => '',
+			'fields'  => array(),
+		);
+
+		if ( isset( $parsed['error'] ) && is_array( $parsed['error'] ) ) {
+			$error['type']    = isset( $parsed['error']['type'] ) ? (string) $parsed['error']['type'] : '';
+			$error['message'] = isset( $parsed['error']['message'] ) ? (string) $parsed['error']['message'] : '';
+
+			return $error;
+		}
+
+		if ( isset( $parsed['errors'] ) && is_array( $parsed['errors'] ) ) {
+			$messages = array();
+
+			foreach ( $parsed['errors'] as $field => $field_messages ) {
+				$error['fields'][] = (string) $field;
+
+				foreach ( (array) $field_messages as $field_message ) {
+					$messages[] = (string) $field_message;
+				}
+			}
+
+			$error['type']    = 'invalid_request';
+			$error['message'] = implode( ' ', $messages );
+		}
+
+		if ( '' === $error['message'] && isset( $parsed['message'] ) ) {
+			$error['message'] = (string) $parsed['message'];
+		}
+
+		return $error;
+	}
+
+	/**
 	 * Traduit les types d'erreur connus en messages exploitables par le marchand.
 	 *
 	 * @param string $type    Type d'erreur renvoye par l'API.
@@ -294,6 +368,10 @@ class WalleoPay_API {
 			case 'authentication_error':
 				return __( 'Clé secrète WalleoPay invalide ou révoquée. Vérifiez les réglages de la passerelle.', 'walleopay' );
 			case 'merchant_not_active':
+			case 'merchant_suspended':
+			case 'account_closed':
+				// Compte suspendu ou ferme : le message de l'API s'adresse au
+				// titulaire (« Ecrivez-nous »), pas au client de la boutique.
 				return __( 'Le compte marchand WalleoPay n’est pas actif.', 'walleopay' );
 			case 'kyc_not_approved':
 				return __( 'La vérification d’identité (KYC) du compte WalleoPay n’est pas encore approuvée.', 'walleopay' );
