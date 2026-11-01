@@ -227,25 +227,23 @@ class WalleoPay_Webhook {
 			return false;
 		}
 
+		// « meta_key » et non « meta_query » : le stockage classique des commandes
+		// ignore ce dernier et renvoie une commande sans rapport avec la reference,
+		// qu'un paiement du meme montant validerait a tort.
 		$orders = wc_get_orders(
 			array(
 				'limit'      => 1,
 				'status'     => 'any',
 				'return'     => 'ids',
-				'meta_query' => array( // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query
-					array(
-						'key'     => '_walleopay_reference',
-						'value'   => $reference,
-						'compare' => '=',
-					),
-				),
+				'meta_key'   => '_walleopay_reference', // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key
+				'meta_value' => $reference, // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 			)
 		);
 
 		if ( ! empty( $orders ) ) {
 			$order = wc_get_order( absint( $orders[0] ) );
 
-			if ( $order instanceof WC_Order ) {
+			if ( $order instanceof WC_Order && $reference === (string) $order->get_meta( '_walleopay_reference' ) ) {
 				return $order;
 			}
 		}
